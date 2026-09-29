@@ -1,0 +1,13 @@
+# JSON 命令行调度器（起始时间公平排队 SFQ，单条非抢占链路）。
+#
+# 从标准输入读取问题、把调度结果写到标准输出：
+#
+#   docker compose run --build --rm -T packets < examples/input.json
+#
+# 也可以挂载目录后传文件路径：
+#
+#   docker compose run --build --rm -v "$PWD/examples:/data:ro" packets /data/input.json
+services:
+  packets:
+    build: .
+    image: packets-scheduler:latest

@@ -1,0 +1,12 @@
+{
+  "streams": [
+    {"id": "a", "weight": 2},
+    {"id": "b", "weight": 1}
+  ],
+  "packets": [
+    {"id": "p1", "stream": "a", "arrival": 0, "duration": 4},
+    {"id": "p2", "stream": "b", "arrival": 0, "duration": 2},
+    {"id": "p3", "stream": "a", "arrival": 1, "duration": 2},
+    {"id": "p4", "stream": "b", "arrival": 9, "duration": 1}
+  ]
+}
