@@ -24,7 +24,6 @@ func referenceSchedule(in *Input) *Output {
 		PacketIn
 		idx           int
 		s, f          *big.Rat
-		weight        int64
 		start, end    int64
 		arrived, done bool
 	}
@@ -45,35 +44,59 @@ func referenceSchedule(in *Input) *Output {
 
 	v := new(big.Rat)
 	lastF := make(map[string]*big.Rat)
+	startedF := make(map[string]*big.Rat)
 	var t int64
 	arrivals := 0 // ps[:arrivals] have been tagged and released
+	changes := 0
 	var cur *rp
+	idleSince := int64(0)
 
 	// assign tags to a packet arriving now.
 	assign := func(p *rp) {
-		s := new(big.Rat)
-		if f := lastF[p.Stream]; f != nil && f.Cmp(v) > 0 {
+		s := new(big.Rat).Set(v)
+		if f := lastF[p.Stream]; f != nil && f.Cmp(s) > 0 {
 			s.Set(f)
-		} else {
-			s.Set(v)
 		}
 		p.s = s
 		p.f = new(big.Rat).Add(s, big.NewRat(p.Duration, weight[p.Stream]))
-		p.weight = weight[p.Stream]
 		lastF[p.Stream] = p.f
 		p.arrived = true
 	}
 
+	// reprice all arrived, waiting packets of one stream in FIFO order.
+	reprice := func(id string) {
+		base := new(big.Rat).Set(v)
+		if f := startedF[id]; f != nil && f.Cmp(base) > 0 {
+			base.Set(f)
+		}
+		var last *rp
+		for _, p := range ps {
+			if p.Stream != id || !p.arrived || p.done {
+				continue
+			}
+			if cur != nil && p.Stream == cur.Stream && p.idx == cur.idx {
+				continue
+			}
+			p.s = new(big.Rat).Set(base)
+			p.f = new(big.Rat).Add(base, big.NewRat(p.Duration, weight[id]))
+			base = p.f
+			last = p
+		}
+		if last != nil {
+			lastF[id] = last.f
+		}
+	}
+
 	for {
 		if cur == nil {
-			// Head-of-queue candidates: per stream, the waiting packet
-			// with the smallest input index.
+			// Head-of-queue candidates: per stream, the earliest input
+			// packet that has arrived and not yet completed.
 			head := make(map[string]*rp)
 			for _, p := range ps {
 				if !p.arrived || p.done {
 					continue
 				}
-				if h, ok := head[p.Stream]; !ok || p.idx < h.idx {
+				if _, ok := head[p.Stream]; !ok {
 					head[p.Stream] = p
 				}
 			}
@@ -93,22 +116,35 @@ func referenceSchedule(in *Input) *Output {
 					return a.ID < b.ID
 				})
 				p := elig[0]
+				if idleSince >= 0 && t > idleSince {
+					out.Idle = append(out.Idle, [2]int64{idleSince, t})
+				}
+				idleSince = -1
 				p.start = t
 				p.end = t + p.Duration
 				v.Set(p.f)
+				startedF[p.Stream] = p.f
 				cur = p
 				out.Schedule = append(out.Schedule, p.ID)
 			} else {
-				if arrivals >= len(ps) {
+				if arrivals >= len(ps) && changes >= len(in.WeightChanges) {
 					break
 				}
-				// Empty system: jump to the next arrival, recording the
-				// idle gap.
-				nt := ps[arrivals].Arrival
-				if nt > t {
-					out.Idle = append(out.Idle, [2]int64{t, nt})
+				// Empty system: jump to the next arrival or change.
+				nt := int64(-1)
+				if arrivals < len(ps) {
+					nt = ps[arrivals].Arrival
+				}
+				if changes < len(in.WeightChanges) && (nt < 0 || in.WeightChanges[changes].At < nt) {
+					nt = in.WeightChanges[changes].At
 				}
 				t = nt
+				for changes < len(in.WeightChanges) && in.WeightChanges[changes].At == t {
+					change := in.WeightChanges[changes]
+					weight[change.Stream] = change.Weight
+					reprice(change.Stream)
+					changes++
+				}
 				for arrivals < len(ps) && ps[arrivals].Arrival == t {
 					assign(ps[arrivals])
 					arrivals++
@@ -117,16 +153,26 @@ func referenceSchedule(in *Input) *Output {
 			continue
 		}
 
-		// Transmitting: advance to the next completion or arrival.
+		// Transmitting: advance to the next completion, change, or arrival.
 		nt := cur.end
 		if arrivals < len(ps) && ps[arrivals].Arrival < nt {
 			nt = ps[arrivals].Arrival
+		}
+		if changes < len(in.WeightChanges) && in.WeightChanges[changes].At < nt {
+			nt = in.WeightChanges[changes].At
 		}
 		t = nt
 		if cur.end == t {
 			out.Completion[cur.Stream] = append(out.Completion[cur.Stream], cur.ID)
 			cur.done = true
 			cur = nil
+			idleSince = t
+		}
+		for changes < len(in.WeightChanges) && in.WeightChanges[changes].At == t {
+			change := in.WeightChanges[changes]
+			weight[change.Stream] = change.Weight
+			reprice(change.Stream)
+			changes++
 		}
 		for arrivals < len(ps) && ps[arrivals].Arrival == t {
 			assign(ps[arrivals])
@@ -136,14 +182,14 @@ func referenceSchedule(in *Input) *Output {
 
 	for _, p := range ps {
 		out.Packets = append(out.Packets, PacketOut{
-			ID:              p.ID,
-			Stream:          p.Stream,
-			Arrival:         p.Arrival,
-			Duration:        p.Duration,
-			StartTag:        p.s.RatString(),
-			FinishTag:       p.f.RatString(),
-			Start:           p.start,
-			End:             p.end,
+			ID:        p.ID,
+			Stream:    p.Stream,
+			Arrival:   p.Arrival,
+			Duration:  p.Duration,
+			StartTag:  p.s.RatString(),
+			FinishTag: p.f.RatString(),
+			Start:     p.start,
+			End:       p.end,
 		})
 	}
 	return out
@@ -160,6 +206,16 @@ func checkOutput(t *testing.T, in *Input, out *Output) {
 	if len(out.Packets) != len(in.Packets) {
 		t.Fatalf("got %d packet records, want %d", len(out.Packets), len(in.Packets))
 	}
+	weightAt := func(stream string, at int64) int64 {
+		w := weight[stream]
+		for _, change := range in.WeightChanges {
+			if change.Stream == stream && change.At <= at {
+				w = change.Weight
+			}
+		}
+		return w
+	}
+
 	byID := make(map[string]PacketOut, len(out.Packets))
 	lastF := make(map[string]*big.Rat)
 	for i, p := range out.Packets {
@@ -184,8 +240,8 @@ func checkOutput(t *testing.T, in *Input, out *Output) {
 		if s.RatString() != p.StartTag || f.RatString() != p.FinishTag {
 			t.Errorf("%s: tags S=%q F=%q not in reduced form", p.ID, p.StartTag, p.FinishTag)
 		}
-		// F = S + duration/weight.
-		if want := new(big.Rat).Add(s, big.NewRat(p.Duration, weight[p.Stream])); f.Cmp(want) != 0 {
+		// F = S + duration/weight in effect when the packet starts.
+		if want := new(big.Rat).Add(s, big.NewRat(p.Duration, weightAt(p.Stream, p.Start))); f.Cmp(want) != 0 {
 			t.Errorf("%s: F=%s, want S+D/w=%s", p.ID, f, want)
 		}
 		// S >= previous finish tag of the same stream.
@@ -363,6 +419,92 @@ func TestGolden(t *testing.T) {
 				Completion: map[string][]string{"a": {"p1", "p3"}, "b": {"p2"}},
 			},
 		},
+		{
+			name: "backlogged packet repriced and reordered",
+			in: Input{
+				Streams: []Stream{{ID: "a", Weight: 1}, {ID: "b", Weight: 1}},
+				Packets: []PacketIn{
+					{ID: "p1", Stream: "a", Arrival: 0, Duration: 4},
+					{ID: "p2", Stream: "a", Arrival: 1, Duration: 4},
+					{ID: "q", Stream: "b", Arrival: 1, Duration: 2},
+				},
+				WeightChanges: []WeightChange{{At: 1, Stream: "a", Weight: 4}},
+			},
+			want: Output{
+				Packets: []PacketOut{
+					{ID: "p1", Stream: "a", Arrival: 0, Duration: 4, StartTag: "0", FinishTag: "4", Start: 0, End: 4},
+					{ID: "p2", Stream: "a", Arrival: 1, Duration: 4, StartTag: "4", FinishTag: "5", Start: 4, End: 8},
+					{ID: "q", Stream: "b", Arrival: 1, Duration: 2, StartTag: "4", FinishTag: "6", Start: 8, End: 10},
+				},
+				Schedule:   []string{"p1", "p2", "q"},
+				Idle:       [][2]int64{},
+				Completion: map[string][]string{"a": {"p1", "p2"}, "b": {"q"}},
+			},
+		},
+		{
+			name: "change during transmission only affects queued packets",
+			in: Input{
+				Streams: []Stream{{ID: "a", Weight: 1}, {ID: "b", Weight: 1}},
+				Packets: []PacketIn{
+					{ID: "p1", Stream: "a", Arrival: 0, Duration: 4},
+					{ID: "p2", Stream: "a", Arrival: 1, Duration: 4},
+					{ID: "q", Stream: "b", Arrival: 1, Duration: 2},
+				},
+				WeightChanges: []WeightChange{{At: 2, Stream: "a", Weight: 4}},
+			},
+			want: Output{
+				Packets: []PacketOut{
+					{ID: "p1", Stream: "a", Arrival: 0, Duration: 4, StartTag: "0", FinishTag: "4", Start: 0, End: 4},
+					{ID: "p2", Stream: "a", Arrival: 1, Duration: 4, StartTag: "4", FinishTag: "5", Start: 4, End: 8},
+					{ID: "q", Stream: "b", Arrival: 1, Duration: 2, StartTag: "4", FinishTag: "6", Start: 8, End: 10},
+				},
+				Schedule:   []string{"p1", "p2", "q"},
+				Idle:       [][2]int64{},
+				Completion: map[string][]string{"a": {"p1", "p2"}, "b": {"q"}},
+			},
+		},
+		{
+			name: "change at completion instant precedes arrival",
+			in: Input{
+				Streams: []Stream{{ID: "a", Weight: 1}, {ID: "b", Weight: 1}},
+				Packets: []PacketIn{
+					{ID: "p1", Stream: "a", Arrival: 0, Duration: 4},
+					{ID: "p2", Stream: "a", Arrival: 4, Duration: 4},
+					{ID: "q", Stream: "b", Arrival: 4, Duration: 2},
+				},
+				WeightChanges: []WeightChange{{At: 4, Stream: "a", Weight: 4}},
+			},
+			want: Output{
+				Packets: []PacketOut{
+					{ID: "p1", Stream: "a", Arrival: 0, Duration: 4, StartTag: "0", FinishTag: "4", Start: 0, End: 4},
+					{ID: "p2", Stream: "a", Arrival: 4, Duration: 4, StartTag: "4", FinishTag: "5", Start: 4, End: 8},
+					{ID: "q", Stream: "b", Arrival: 4, Duration: 2, StartTag: "4", FinishTag: "6", Start: 8, End: 10},
+				},
+				Schedule:   []string{"p1", "p2", "q"},
+				Idle:       [][2]int64{},
+				Completion: map[string][]string{"a": {"p1", "p2"}, "b": {"q"}},
+			},
+		},
+		{
+			name: "idle change affects the next arrival batch",
+			in: Input{
+				Streams: []Stream{{ID: "a", Weight: 1}, {ID: "b", Weight: 1}},
+				Packets: []PacketIn{
+					{ID: "p", Stream: "a", Arrival: 5, Duration: 4},
+					{ID: "q", Stream: "b", Arrival: 5, Duration: 2},
+				},
+				WeightChanges: []WeightChange{{At: 2, Stream: "a", Weight: 4}},
+			},
+			want: Output{
+				Packets: []PacketOut{
+					{ID: "p", Stream: "a", Arrival: 5, Duration: 4, StartTag: "0", FinishTag: "1", Start: 5, End: 9},
+					{ID: "q", Stream: "b", Arrival: 5, Duration: 2, StartTag: "0", FinishTag: "2", Start: 9, End: 11},
+				},
+				Schedule:   []string{"p", "q"},
+				Idle:       [][2]int64{{0, 5}},
+				Completion: map[string][]string{"a": {"p"}, "b": {"q"}},
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -407,7 +549,30 @@ func randomInput(rng *rand.Rand) *Input {
 			Duration: 1 + int64(rng.Intn(20)),
 		}
 	}
-	return &Input{Streams: streams, Packets: pkts}
+	changes := make([]WeightChange, 0)
+	if len(pkts) > 0 {
+		seenChange := make(map[WeightChange]bool)
+		for i := 0; i < 6; i++ {
+			change := WeightChange{
+				At:     rng.Int63n(at + 10),
+				Stream: streams[rng.Intn(ns)].ID,
+				Weight: int64(1 + rng.Intn(10)),
+			}
+			key := WeightChange{At: change.At, Stream: change.Stream}
+			if seenChange[key] {
+				continue
+			}
+			seenChange[key] = true
+			changes = append(changes, change)
+		}
+		sort.Slice(changes, func(i, j int) bool {
+			if changes[i].At != changes[j].At {
+				return changes[i].At < changes[j].At
+			}
+			return changes[i].Stream < changes[j].Stream
+		})
+	}
+	return &Input{Streams: streams, Packets: pkts, WeightChanges: changes}
 }
 
 // randomInputWide builds larger random problems at the spec limits.
@@ -431,7 +596,30 @@ func randomInputWide(rng *rand.Rand) *Input {
 			Duration: 1 + int64(rng.Intn(1000)),
 		}
 	}
-	return &Input{Streams: streams, Packets: pkts}
+	changes := make([]WeightChange, 0)
+	if len(pkts) > 0 {
+		seenChange := make(map[WeightChange]bool)
+		for i := 0; i < 20; i++ {
+			change := WeightChange{
+				At:     rng.Int63n(at + 2000),
+				Stream: streams[rng.Intn(ns)].ID,
+				Weight: int64(1 + rng.Intn(10)),
+			}
+			key := WeightChange{At: change.At, Stream: change.Stream}
+			if seenChange[key] {
+				continue
+			}
+			seenChange[key] = true
+			changes = append(changes, change)
+		}
+		sort.Slice(changes, func(i, j int) bool {
+			if changes[i].At != changes[j].At {
+				return changes[i].At < changes[j].At
+			}
+			return changes[i].Stream < changes[j].Stream
+		})
+	}
+	return &Input{Streams: streams, Packets: pkts, WeightChanges: changes}
 }
 
 // TestDifferential cross-checks schedule against the reference simulator
@@ -512,6 +700,18 @@ func TestValidate(t *testing.T) {
 		"duration zero":      mk(func(in *Input) { in.Packets[0].Duration = 0 }),
 		"duration too large": mk(func(in *Input) { in.Packets[0].Duration = 1001 }),
 		"empty packet id":    mk(func(in *Input) { in.Packets[0].ID = "" }),
+		"unsorted change": mk(func(in *Input) {
+			in.WeightChanges = []WeightChange{
+				{At: 3, Stream: "a", Weight: 2},
+				{At: 2, Stream: "b", Weight: 2},
+			}
+		}),
+		"duplicate same-stream change": mk(func(in *Input) {
+			in.WeightChanges = []WeightChange{
+				{At: 2, Stream: "a", Weight: 2},
+				{At: 2, Stream: "a", Weight: 3},
+			}
+		}),
 	}
 	for name, in := range cases {
 		if err := validate(in); err == nil {
